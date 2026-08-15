@@ -1,8 +1,8 @@
 [package]
 name = "axiom-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Proof-gated capability runtime for Axiom programs"
+description = "Proof-gated AXIOM-PROGRAM/2 execution runtime"
 license = "MIT"
 publish = false
 

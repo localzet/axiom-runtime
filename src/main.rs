@@ -1,98 +1,137 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, fs};
+
 fn main() -> Result<()> {
-    let mut a = env::args().skip(1);
-    if a.next().as_deref() != Some("run") {
+    let mut args = env::args().skip(1);
+    if args.next().as_deref() != Some("run") {
         bail!("usage: axiom-runtime run --spec S --program P --proof R --x N");
     }
-    let sp = arg(&mut a, "--spec")?;
-    let pp = arg(&mut a, "--program")?;
-    let rp = arg(&mut a, "--proof")?;
-    let x: i64 = arg(&mut a, "--x")?.parse()?;
-    let s = fs::read_to_string(sp)?;
-    let p = fs::read_to_string(pp)?;
-    let r = fs::read_to_string(rp)?;
-    let receipt = parse_receipt(&r)?;
+    let spec_path = arg(&mut args, "--spec")?;
+    let program_path = arg(&mut args, "--program")?;
+    let proof_path = arg(&mut args, "--proof")?;
+    let x: i64 = arg(&mut args, "--x")?.parse()?;
+
+    let spec = fs::read_to_string(spec_path)?;
+    let program = fs::read_to_string(program_path)?;
+    let proof = fs::read_to_string(proof_path)?;
+    authorize(&spec, &program, &proof, x)?;
+    println!("{}", execute(&program, x)?);
+    Ok(())
+}
+
+fn authorize(spec: &str, program: &str, proof: &str, x: i64) -> Result<()> {
+    let receipt = parse_kv(proof, "AXIOM-PROOF/2")?;
     if receipt.get("verdict").map(String::as_str) != Some("VALID") {
         bail!("receipt is not VALID");
     }
-    if receipt.get("spec.sha256") != Some(&hex(&hash(s.as_bytes()))) {
-        bail!("spec hash does not match receipt");
+    if receipt.get("spec.sha256") != Some(&sha256_hex(spec.as_bytes())) {
+        bail!("spec hash mismatch");
     }
-    if receipt.get("program.sha256") != Some(&hex(&hash(p.as_bytes()))) {
-        bail!("program hash does not match receipt");
+    if receipt.get("program.sha256") != Some(&sha256_hex(program.as_bytes())) {
+        bail!("program hash mismatch");
     }
-    let min: i64 = receipt["domain.min"].parse()?;
-    let max: i64 = receipt["domain.max"].parse()?;
-    if x < min || x > max {
-        bail!("input {x} lies outside proven domain {min}..{max}");
+    if receipt.get("soundness.scope").map(String::as_str) != Some("exact-for-supported-fragment") {
+        bail!("runtime does not accept this proof scope");
     }
-    let result = run_program(&p, x)?;
-    println!("{result}");
+
+    let spec_doc = parse_kv(spec, "AXIOM-IR/2")?;
+    let input = &spec_doc["input.0.name"];
+    let kind = &spec_doc[&format!("domain.{input}.kind")];
+    match kind.as_str() {
+        "unbounded" => {}
+        "range" => {
+            let min: i64 = spec_doc[&format!("domain.{input}.min")].parse()?;
+            let max: i64 = spec_doc[&format!("domain.{input}.max")].parse()?;
+            if x < min || x > max {
+                bail!("input {x} lies outside proven range {min}..{max}");
+            }
+        }
+        other => bail!("unsupported domain kind: {other}"),
+    }
     Ok(())
 }
-fn arg(a: &mut impl Iterator<Item = String>, name: &str) -> Result<String> {
-    let f = a.next().context("missing flag")?;
-    if f != name {
-        bail!("expected {name}, got {f}");
-    }
-    a.next().context("missing value")
-}
-fn parse_receipt(raw: &str) -> Result<BTreeMap<String, String>> {
-    let mut it = raw.lines();
-    if it.next() != Some("AXIOM-PROOF/1") {
-        bail!("bad proof header");
-    }
-    let mut m = BTreeMap::new();
-    for l in it.filter(|l| !l.trim().is_empty()) {
-        let (k, v) = l.split_once('=').context("bad proof line")?;
-        m.insert(k.to_owned(), v.to_owned());
-    }
-    Ok(m)
-}
-fn run_program(raw: &str, x: i64) -> Result<i64> {
-    let mut r = [0i64; 128];
-    let mut code = false;
-    for l in raw.lines() {
-        let t = l.trim();
-        if t == "code:" {
-            code = true;
+
+fn execute(raw: &str, x: i64) -> Result<i64> {
+    let mut registers = [0i64; 256];
+    let mut in_code = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line == "code:" {
+            in_code = true;
             continue;
         }
-        if t == "end" {
+        if line == "end" {
             break;
         }
-        if !code {
+        if !in_code || line.is_empty() {
             continue;
         }
-        let w: Vec<_> = t.split_whitespace().collect();
-        match w.as_slice() {
-            ["LOAD_INPUT", d, "x"] => r[reg(d)?] = x,
-            ["CONST", d, v] => r[reg(d)?] = v.parse()?,
-            ["NEG", d, a] => r[reg(d)?] = r[reg(a)?].wrapping_neg(),
-            ["ADD", d, a, b] => r[reg(d)?] = r[reg(a)?].wrapping_add(r[reg(b)?]),
-            ["SUB", d, a, b] => r[reg(d)?] = r[reg(a)?].wrapping_sub(r[reg(b)?]),
-            ["SELECT_NEG", d, a, b] => r[reg(d)?] = if x < 0 { r[reg(a)?] } else { r[reg(b)?] },
-            ["RETURN", a] => return Ok(r[reg(a)?]),
-            _ => bail!("unsupported instruction: {t}"),
+        let words: Vec<_> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["LOAD_INPUT", dest, "x"] => registers[register(dest)?] = x,
+            ["CONST", dest, value] => registers[register(dest)?] = value.parse()?,
+            ["NEG", dest, src] => {
+                registers[register(dest)?] = registers[register(src)?].wrapping_neg()
+            }
+            ["ADD", dest, left, right] => {
+                registers[register(dest)?] =
+                    registers[register(left)?].wrapping_add(registers[register(right)?]);
+            }
+            ["SUB", dest, left, right] => {
+                registers[register(dest)?] =
+                    registers[register(left)?].wrapping_sub(registers[register(right)?]);
+            }
+            ["SELECT_NEG_INPUT", dest, "x", negative, nonnegative] => {
+                registers[register(dest)?] = if x < 0 {
+                    registers[register(negative)?]
+                } else {
+                    registers[register(nonnegative)?]
+                };
+            }
+            ["RETURN", src] => return Ok(registers[register(src)?]),
+            _ => bail!("unsupported instruction: {line}"),
         }
     }
-    bail!("no RETURN")
+    bail!("program has no RETURN")
 }
-fn reg(s: &str) -> Result<usize> {
-    let n = s
+
+fn arg(args: &mut impl Iterator<Item = String>, expected: &str) -> Result<String> {
+    let flag = args.next().context("missing flag")?;
+    if flag != expected {
+        bail!("expected {expected}, got {flag}");
+    }
+    args.next().context("missing value")
+}
+
+fn register(raw: &str) -> Result<usize> {
+    let number = raw
         .strip_prefix('r')
-        .context("bad register")?
+        .context("invalid register")?
         .parse::<usize>()?;
-    if n >= 128 {
-        bail!("register out of range")
-    };
-    Ok(n)
+    if number >= 256 {
+        bail!("register out of range");
+    }
+    Ok(number)
 }
-fn hash(b: &[u8]) -> [u8; 32] {
-    Sha256::digest(b).into()
+
+fn parse_kv(raw: &str, header: &str) -> Result<BTreeMap<String, String>> {
+    let mut lines = raw.lines();
+    if lines.next() != Some(header) {
+        bail!("expected {header}");
+    }
+    let mut map = BTreeMap::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    Ok(map)
 }
-fn hex(h: &[u8; 32]) -> String {
-    h.iter().map(|b| format!("{b:02x}")).collect()
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
