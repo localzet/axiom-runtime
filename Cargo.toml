@@ -1,0 +1,11 @@
+[package]
+name = "axiom-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Proof-gated capability runtime for Axiom programs"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+sha2 = "0.10"
