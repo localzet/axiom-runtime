@@ -25,6 +25,9 @@ fn authorize(spec: &str, program: &str, proof: &str, x: i64) -> Result<()> {
     if receipt.get("verdict").map(String::as_str) != Some("VALID") {
         bail!("receipt is not VALID");
     }
+    if receipt.get("counterexample").map(String::as_str) != Some("none") {
+        bail!("VALID receipt must not carry a counterexample");
+    }
     if receipt.get("spec.sha256") != Some(&sha256_hex(spec.as_bytes())) {
         bail!("spec hash mismatch");
     }
@@ -36,13 +39,21 @@ fn authorize(spec: &str, program: &str, proof: &str, x: i64) -> Result<()> {
     }
 
     let spec_doc = parse_kv(spec, "AXIOM-IR/2")?;
-    let input = &spec_doc["input.0.name"];
-    let kind = &spec_doc[&format!("domain.{input}.kind")];
+    let input = spec_doc.get("input.0.name").context("missing input name")?;
+    let kind = spec_doc
+        .get(&format!("domain.{input}.kind"))
+        .context("missing domain kind")?;
     match kind.as_str() {
         "unbounded" => {}
         "range" => {
-            let min: i64 = spec_doc[&format!("domain.{input}.min")].parse()?;
-            let max: i64 = spec_doc[&format!("domain.{input}.max")].parse()?;
+            let min: i64 = spec_doc
+                .get(&format!("domain.{input}.min"))
+                .context("missing domain minimum")?
+                .parse()?;
+            let max: i64 = spec_doc
+                .get(&format!("domain.{input}.max"))
+                .context("missing domain maximum")?
+                .parse()?;
             if x < min || x > max {
                 bail!("input {x} lies outside proven range {min}..{max}");
             }
@@ -72,15 +83,19 @@ fn execute(raw: &str, x: i64) -> Result<i64> {
             ["LOAD_INPUT", dest, "x"] => registers[register(dest)?] = x,
             ["CONST", dest, value] => registers[register(dest)?] = value.parse()?,
             ["NEG", dest, src] => {
-                registers[register(dest)?] = registers[register(src)?].wrapping_neg()
+                registers[register(dest)?] = registers[register(src)?]
+                    .checked_neg()
+                    .context("integer negation overflow")?
             }
             ["ADD", dest, left, right] => {
-                registers[register(dest)?] =
-                    registers[register(left)?].wrapping_add(registers[register(right)?]);
+                registers[register(dest)?] = registers[register(left)?]
+                    .checked_add(registers[register(right)?])
+                    .context("integer addition overflow")?;
             }
             ["SUB", dest, left, right] => {
-                registers[register(dest)?] =
-                    registers[register(left)?].wrapping_sub(registers[register(right)?]);
+                registers[register(dest)?] = registers[register(left)?]
+                    .checked_sub(registers[register(right)?])
+                    .context("integer subtraction overflow")?;
             }
             ["SELECT_NEG_INPUT", dest, "x", negative, nonnegative] => {
                 registers[register(dest)?] = if x < 0 {
@@ -121,9 +136,10 @@ fn parse_kv(raw: &str, header: &str) -> Result<BTreeMap<String, String>> {
         bail!("expected {header}");
     }
     let mut map = BTreeMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once('=') {
-            map.insert(key.to_owned(), value.to_owned());
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let (key, value) = line.split_once('=').context("malformed artifact field")?;
+        if map.insert(key.to_owned(), value.to_owned()).is_some() {
+            bail!("duplicate artifact field: {key}");
         }
     }
     Ok(map)
@@ -134,4 +150,34 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn program(code: &str) -> String {
+        format!("AXIOM-PROGRAM/2\ncode:\n{code}\nend\n")
+    }
+
+    #[test]
+    fn arithmetic_fails_instead_of_wrapping() {
+        let negate = program("LOAD_INPUT r0 x\nNEG r1 r0\nRETURN r1");
+        assert_eq!(execute(&negate, -123).unwrap(), 123);
+        assert!(execute(&negate, i64::MIN).is_err());
+        let add = program("LOAD_INPUT r0 x\nCONST r1 1\nADD r2 r0 r1\nRETURN r2");
+        assert!(execute(&add, i64::MAX).is_err());
+        let subtract = program("LOAD_INPUT r0 x\nCONST r1 1\nSUB r2 r0 r1\nRETURN r2");
+        assert!(execute(&subtract, i64::MIN).is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_artifacts_and_missing_domain() {
+        assert!(parse_kv("AXIOM-IR/2\nmodule=a\nmodule=b\n", "AXIOM-IR/2").is_err());
+        assert!(parse_kv("AXIOM-IR/2\nmalformed\n", "AXIOM-IR/2").is_err());
+        let spec = "AXIOM-IR/2\nmodule=abs\n";
+        let program = program("LOAD_INPUT r0 x\nRETURN r0");
+        let proof = format!("AXIOM-PROOF/2\nverdict=VALID\ncounterexample=none\nspec.sha256={}\nprogram.sha256={}\nsoundness.scope=exact-for-supported-fragment\n", sha256_hex(spec.as_bytes()), sha256_hex(program.as_bytes()));
+        assert!(authorize(spec, &program, &proof, 0).is_err());
+    }
 }
