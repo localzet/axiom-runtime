@@ -1,4 +1,9 @@
 # axiom-runtime v0.2.0
 
-Proof-gated execution of `AXIOM-PROGRAM/2`. A symbolic receipt over an unbounded domain authorizes any runtime integer
-input; a range-scoped proof remains range-limited. Artifact mutation invalidates authorization by SHA-256 binding.
+Исполнение `AXIOM-PROGRAM/2` только через proof gate. Символический receipt для неограниченной области разрешает любой
+целочисленный runtime-вход; доказательство, ограниченное диапазоном, остаётся ограниченным этим диапазоном. Любое
+изменение артефакта аннулирует авторизацию благодаря SHA-256-привязке.
+
+## Связанные исследования
+
+Этот компонент входит в исследовательский проект [Axiom](https://github.com/localzet/axiom-stack). Все компоненты собраны по теме [localzet-axiom](https://github.com/topics/localzet-axiom). Основной язык документации — русский. Исследовательские результаты и ограничения не означают готовность к промышленному применению.
