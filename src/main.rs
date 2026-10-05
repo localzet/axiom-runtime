@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Ivan Zorin <creator@localzet.com> (Localzet contributions)
+// SPDX-License-Identifier: MIT
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, env, fs};
